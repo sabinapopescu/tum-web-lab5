@@ -3,9 +3,18 @@
 import socket
 import ssl
 import sys
+import os
+import re
+import json
+import hashlib
+import time
 import argparse
 from html.parser import HTMLParser
-from urllib.parse import urlparse, quote_plus, parse_qs, unquote
+from urllib.parse import urlparse, quote_plus, unquote, parse_qs
+
+# ─── Cache config ────────────────────────────────────────────────────────────
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".go2web_cache")
+CACHE_TTL = 3600  # 1 hour
 
 # ─── HTML → plain text ───────────────────────────────────────────────────────
 class TextExtractor(HTMLParser):
@@ -36,8 +45,18 @@ class TextExtractor(HTMLParser):
 
     def get_text(self):
         raw = "".join(self.chunks)
-        lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        return "\n".join(lines)
+        lines = [l.strip() for l in raw.splitlines()]
+        lines = [l for l in lines if l]
+        out, prev_blank = [], False
+        for l in lines:
+            if not l:
+                if not prev_blank:
+                    out.append("")
+                prev_blank = True
+            else:
+                out.append(l)
+                prev_blank = False
+        return "\n".join(out)
 
 
 def html_to_text(html):
@@ -46,10 +65,49 @@ def html_to_text(html):
         p.feed(html)
     except Exception:
         pass
-    return p.get_text()
+    text = p.get_text()
+    if not text.strip():
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+    return text
 
 
-# ─── Raw TCP/TLS request with redirect support ────────────────────────────────
+# ─── Cache helpers ────────────────────────────────────────────────────────────
+def cache_key(url):
+    return hashlib.md5(url.encode()).hexdigest()
+
+def cache_get(url):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, cache_key(url) + ".json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            entry = json.load(f)
+        if time.time() - entry["ts"] > CACHE_TTL:
+            os.remove(path)
+            return None
+        return entry["body"]
+    except Exception:
+        return None
+
+def cache_set(url, body):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, cache_key(url) + ".json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "body": body}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def cache_clear(url):
+    path = os.path.join(CACHE_DIR, cache_key(url) + ".json")
+    if os.path.exists(path):
+        os.remove(path)
+
+
+# ─── Raw TCP/TLS request ─────────────────────────────────────────────────────
 def make_request(url, max_redirects=8):
     for _ in range(max_redirects):
         parsed = urlparse(url)
@@ -74,6 +132,8 @@ def make_request(url, max_redirects=8):
                 break
             if location.startswith("/"):
                 location = f"{scheme}://{host}{location}"
+            elif not location.startswith("http"):
+                location = f"{scheme}://{host}/{location}"
             url = location
             continue
 
@@ -92,7 +152,7 @@ def _tcp_fetch(host, port, path, scheme):
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"User-Agent: Mozilla/5.0 (compatible; go2web/1.0)\r\n"
-        f"Accept: text/html,application/json;q=0.9,*/*;q=0.8\r\n"
+        f"Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8\r\n"
         f"Accept-Language: en-US,en;q=0.5\r\n"
         f"Accept-Encoding: identity\r\n"
         f"Connection: close\r\n"
@@ -175,7 +235,8 @@ class DDGParser(HTMLParser):
         if tag != "a":
             return
         attrs = dict(attrs)
-        if "result__a" not in attrs.get("class", ""):
+        cls = attrs.get("class", "")
+        if "result__a" not in cls:
             return
         href = attrs.get("href", "")
         if "uddg=" in href:
@@ -203,17 +264,44 @@ class DDGParser(HTMLParser):
             self._title = ""
 
 
+def _fallback_parse(html):
+    results = []
+    for m in re.finditer(r'href="(https?://(?!.*duckduckgo\.com)[^"]{10,})"[^>]*>\s*([^<]{5,120})', html):
+        url, title = m.group(1).strip(), m.group(2).strip()
+        if not any(r["url"] == url for r in results):
+            results.append({"title": title, "url": url})
+    return results
+
+
 def search_ddg(term):
     query = quote_plus(term)
     url = f"https://html.duckduckgo.com/html/?q={query}"
-    status, headers, html = make_request(url)
+
+    from_cache = False
+    cached = cache_get(url)
+    if cached:
+        html = cached
+        from_cache = True
+    else:
+        status, headers, html = make_request(url)
+        if not html.strip():
+            print("Empty response from DuckDuckGo.")
+            return []
+        cache_set(url, html)
+
+    if from_cache:
+        print("(cached)\n")
 
     parser = DDGParser()
     parser.feed(html)
     results = parser.results[:10]
 
     if not results:
+        results = _fallback_parse(html)[:10]
+
+    if not results:
         print("No results found.")
+        print(f"Tip: delete cache folder and retry: {CACHE_DIR}")
         return []
 
     for i, r in enumerate(results, 1):
@@ -223,35 +311,51 @@ def search_ddg(term):
     return results
 
 
+# ─── Fetch + display URL ──────────────────────────────────────────────────────
 def fetch_url(url):
     if not url.startswith("http"):
         url = "https://" + url
 
+    cached = cache_get(url)
+    if cached:
+        print("(cached)\n")
+        print(cached)
+        return
+
     status, headers, body = make_request(url)
+
     if status is None:
-        print("Error: request failed.")
+        print("Error: request failed (too many redirects or connection error).")
         sys.exit(1)
 
-    import json
     ct = headers.get("content-type", "")
     if "json" in ct:
         try:
-            output = json.dumps(json.loads(body), indent=2)
+            output = json.dumps(json.loads(body), indent=2, ensure_ascii=False)
         except Exception:
             output = body
     else:
         output = html_to_text(body)
 
+    if not output.strip():
+        print(f"[Empty response — HTTP {status}]")
+        return
+
+    cache_set(url, output)
     print(output)
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 HELP = """go2web — HTTP over raw TCP sockets
 
 Usage:
-  go2web -u <URL>          Make an HTTP request and print human-readable output
-  go2web -s <search term>  Search DuckDuckGo and print top 10 results
-  go2web -h                Show this help
+  go2web -u <URL>           Make an HTTP request and print human-readable output
+  go2web -s <search term>   Search DuckDuckGo and print top 10 results
+  go2web -h                 Show this help
+  go2web -u <URL> --clear-cache   Force fresh fetch (ignore cache)
+
+Cache:
+  Responses cached 1 hour in ~/.go2web_cache/
 
 Examples:
   go2web -u https://example.com
@@ -264,6 +368,8 @@ def main():
     parser.add_argument("-u", metavar="URL")
     parser.add_argument("-s", metavar="TERM", nargs="+")
     parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--clear-cache", action="store_true")
+
     args = parser.parse_args()
 
     if args.help or (not args.u and not args.s):
@@ -271,10 +377,15 @@ def main():
         return
 
     if args.u:
+        if args.clear_cache:
+            cache_clear(args.u)
         fetch_url(args.u)
 
     if args.s:
         term = " ".join(args.s)
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(term)}"
+        if args.clear_cache:
+            cache_clear(search_url)
         results = search_ddg(term)
 
         if results:
